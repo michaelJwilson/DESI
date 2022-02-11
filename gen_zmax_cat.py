@@ -1,23 +1,28 @@
 import os
 import time
+import argparse
+import runtime
 import numpy as np
 
-from cosmo import distmod
-from smith_kcorr import GAMA_KCorrection
-from tmr_ecorr import tmr_ecorr
-from scipy.optimize import brentq, minimize
-from astropy.table import Table
+from   cosmo import distmod
+from   smith_kcorr import GAMA_KCorrection
+from   tmr_ecorr import tmr_ecorr
+from   scipy.optimize import brentq, minimize
+from   astropy.table import Table
+from   functools import partial
+from   multiprocessing import Pool
+
 
 kcorr_r = GAMA_KCorrection(band='R')
 
 def theta(z, rest_gmr_0p1, rest_gmr_0p0, aall=False):
-    z = np.atleast_1d(z)
+    z            = np.atleast_1d(z)
     rest_gmr_0p1 = np.atleast_1d(rest_gmr_0p1)
     rest_gmr_0p0 = np.atleast_1d(rest_gmr_0p0)
     
-    result = distmod(z) + kcorr_r.k_nonnative_zref(0.0, z, rest_gmr_0p1) + tmr_ecorr(z, rest_gmr_0p0, aall=aall)
+    result       = distmod(z) + kcorr_r.k_nonnative_zref(0.0, z, rest_gmr_0p1) + tmr_ecorr(z, rest_gmr_0p0, aall=aall)
 
-    return result[0]
+    return  result[0]
     
 def solve_theta(rest_gmr_0p1, rest_gmr_0p0, thetaz, dr, aall=False):
      def diff(x):
@@ -48,11 +53,12 @@ def solve_theta(rest_gmr_0p1, rest_gmr_0p0, thetaz, dr, aall=False):
 
 def zmax(rest_gmrs_0p1, rest_gmrs_0p0, theta_zs, drs, aall=False, debug=True):
    result = []
-   start = time.time()
+   start  = time.time()
 
    if debug:
         print('Solving for zlimit.')
 
+   '''
    for i, (rest_gmr_0p1, rest_gmr_0p0, theta_z, dr) in enumerate(zip(rest_gmrs_0p1, rest_gmrs_0p0, theta_zs, drs)):
         interim, warn = solve_theta(rest_gmr_0p1, rest_gmr_0p0, theta_z, dr, aall=aall)
 
@@ -62,49 +68,79 @@ def zmax(rest_gmrs_0p1, rest_gmrs_0p0, theta_zs, drs, aall=False, debug=True):
              runtime = (time.time() - start) / 60.
 
              print('{:.3f}% complete after {:.2f} mins.'.format(100. * i / len(theta_zs), runtime))
-
+   '''
+   with Pool(processes=14) as pool:
+       arglist = list(zip(rest_gmrs_0p1, rest_gmrs_0p0, theta_zs, drs))
+       result  = pool.starmap(partial(solve_theta, aall=aall), arglist)
+   
    result = np.array(result)
 
    return  result[:,0], result[:,1]
 
-#######
-#######  Main
-#######
 
-aall=False
-dryrun=True
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Gen zmax cat.')
+    parser.add_argument('-a', '--aall', help='All Q, no red/blue split.', action='store_true')
+    parser.add_argument('-d', '--dryrun', help='Dryrun.', action='store_true')
+    parser.add_argument('--nooverwrite',  help='Do not overwrite outputs if on disk', action='store_true')
+    
+    args = parser.parse_args()
+    aall = args.aall
+    dryrun = args.dryrun
+    
+    rlim = 19.8
+    rmax = 12.0
 
-rlim = 19.8
-rmax = 12.0
+    start = time.time()
 
-ngal = 1500
+    print('Assuming {:.4f} < r < {:.4f}'.format(rmax, rlim))
+    print('Assuming Q ALL = {}'.format(aall))
+    
+    root = os.environ['GOLD_DIR']
 
-root = os.environ['CSCRATCH'] + '/norberg/'
+    fpath = root + '/gama_gold_kE.fits'
+    opath = root + '/gama_gold_zmax.fits'
 
-fpath = root + '/GAMA4/gama_gold_kE.fits'
-opath = root + '/GAMA4/gama_gold_zmax.fits'
+    if dryrun:
+        fpath = fpath.replace('.fits', '_dryrun.fits')
+        opath = opath.replace('.fits', '_dryrun.fits')
 
-dat = Table.read(fpath)
-dat.pprint()
+    if args.nooverwrite:
+        if os.path.isfile(opath):
+            print('{} found on disk and overwrite forbidden (--nooverwrite).'.format(opath))
+            exit(0)
+        
+    print('Reading {}.'.format(fpath))
+        
+    dat = Table.read(fpath)
+    dat.pprint()
 
-if dryrun:
-  dat = Table(np.random.choice(dat, ngal))
-  opath=opath.replace('_zmax', '_zmax_{:d}k'.format(np.int(ngal / 1000.)))
+    dat['DELTA_RPETRO_FAINT'] = rlim - dat['R_PETRO']
 
-dat['DELTA_RPETRO_FAINT'] = rlim - dat['R_PETRO']
+    print('Solving for {} bounding curve'.format(rlim))
+    
+    zmaxs, warn = zmax(dat['REST_GMR_0P1'], dat['REST_GMR_0P0'], dat['Z_THETA_QCOLOR'], dat['DELTA_RPETRO_FAINT'],\
+                       aall=aall, debug=True)
 
-zmaxs, warn = zmax(dat['REST_GMR_0P1'], dat['REST_GMR_0P0'], dat['Z_THETA_QCOLOR'], dat['DELTA_RPETRO_FAINT'], aall=aall, debug=dryrun)
+    dat['ZMAX'] = zmaxs
+    dat['ZMAX_WARN'] = warn
 
-dat['ZMAX'] = zmaxs
-dat['ZMAX_WARN'] = warn
+    dat['DELTA_RPETRO_BRIGHT'] = rmax - dat['R_PETRO']
 
-dat['DELTA_RPETRO_BRIGHT'] = rmax - dat['R_PETRO']
+    print('Solving for {} bounding curve'.format(rmax))
+    
+    zmins, warn = zmax(dat['REST_GMR_0P1'], dat['REST_GMR_0P0'], dat['Z_THETA_QCOLOR'], dat['DELTA_RPETRO_BRIGHT'],\
+                       aall=aall, debug=True)
 
-zmins, warn = zmax(dat['REST_GMR_0P1'], dat['REST_GMR_0P0'], dat['Z_THETA_QCOLOR'], dat['DELTA_RPETRO_BRIGHT'], aall=aall, debug=dryrun)
+    dat['ZMIN'] = zmins
+    dat['ZMIN_WARN'] = warn
 
-dat['ZMIN'] = zmins
-dat['ZMIN_WARN'] = warn
+    print('Writing {}.'.format(opath))
 
-print('Writing {}.'.format(opath))
+    dat.pprint()
 
-dat.write(opath, format='fits', overwrite=True)
+    dat.write(opath, format='fits', overwrite=True)
+
+    runtime = (time.time() - start) / 60.
+
+    print('\n\nDone in {} mins.\n\n'.format(runtime))
