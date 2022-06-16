@@ -1,141 +1,186 @@
 import os
 import sys
+import yaml
 import runtime
 import argparse
-import pylab as pl
-import numpy as np
-import astropy.io.fits as fits
-import matplotlib.pyplot as plt
+import pylab            as     pl
+import numpy            as     np
+import astropy.io.fits  as     fits
 
-from   astropy.table import Table, vstack
-from   vmaxer import vmaxer
-from   smith_kcorr import test_plots, test_nonnative_plots
-from   cosmo import distmod, volcom
-from   lumfn import lumfn
-from   schechter import schechter, named_schechter
-from   gama_limits import gama_field, gama_limits
+from   astropy.table    import Table, vstack
+from   vmaxer           import vmaxer, vmaxer_rand
+from   lumfn            import lumfn
+from   lumfn_stepwise   import lumfn_stepwise
+from   schechter        import schechter, named_schechter, ref_schechter
 from   renormalise_d8LF import renormalise_d8LF
-from   delta8_limits import d8_limits
+from   delta8_limits    import d8_limits
+from   config           import Configuration
+from   findfile         import findfile, fetch_fields, overwrite_check, gather_cat, call_signature, write_desitable, fetch_header
+from   jackknife_limits import solve_jackknife, set_jackknife, jackknife_mean
+from   bitmask          import update_bit, lumfn_mask
+from   params           import fillfactor_threshold
+from   runtime          import calc_runtime
 
 
-def process_cat(fpath, vmax_opath, field=None, rand_paths=[]):
-    assert 'vmax' in vmax_opath
-
+def process_cat(fpath, vmax_opath, survey='gama', extra_cols=[], bitmasks=['IN_D8LUMFN'], fillfactor=False, conservative=False, tier=None, d8=None, fdelta=None, fdelta_zp=None):        
     opath = vmax_opath
 
     if not os.path.isfile(fpath):
+        # Do not crash and burn, but proceed on gracefully. 
         print('WARNING:  Failed to find {}'.format(fpath))
-        return 1
+        return  1
 
-    gama_zmax = Table.read(fpath)
+    zmax  = Table.read(fpath)
 
-    if 'FIELD' not in gama_zmax.dtype.names:
-        # print('WARNING:  Missing FIELD keyword, adding it.')
-        # gama_zmax['FIELD'] = gama_field(gama_zmax['RA'].data, gama_zmax['DEC'].data)
+    if len(zmax) == 0:
+        print('Zero length catalogue, nothing to be done.') 
+        return -99
+             
+    minz  = zmax['ZSURV'].min()
+    maxz  = zmax['ZSURV'].max()
+    
+    print('Found redshift limits: {:.3f} < z < {:.3f}'.format(minz, maxz))
 
-        raise  RuntimeError('FIELD MISSING FROM DTYPES.')
+    update_bit(zmax['IN_D8LUMFN'], lumfn_mask, 'FILLFACTOR', zmax['FILLFACTOR'].data < fillfactor_threshold)
+
+    vmax  = vmaxer(zmax, minz, maxz, fillfactor=fillfactor, bitmasks=bitmasks, extra_cols=extra_cols, tier=tier)
+    vmax.meta['EXTNAME'] = 'VMAX'
         
-    found_fields = np.unique(gama_zmax['FIELD'].data)
-        
-    print('Found fields: {}'.format(found_fields))
-                            
-    zmin = gama_zmax['ZGAMA'].min()
-    zmax = gama_zmax['ZGAMA'].max()
-    
-    print('Found redshift limits: {:.3f} < z < {:.3f}'.format(zmin, zmax))
-
-    if field != None:
-        assert  len(found_fields) == 1, 'ERROR: EXPECTED SINGLE FIELD RESTRICTED INPUT, e.g. G9.'
-
-    if len(rand_paths) > 0:
-        rand  = vstack([Table.read(_x) for _x in rand_paths])
-    else:
-        rand  = None
-
-    gama_vmax = vmaxer(gama_zmax, zmin, zmax, extra_cols=['MCOLOR_0P0', 'DDPMALL_0P0_VISZ'], rand=rand)
-
-    print('WARNING:  Found {:.3f}% with zmax < 0.0'.format(100. * np.mean(gama_vmax['ZMAX'] <= 0.0)))
-    
-    # TODO: Why do we need this?                                                                                                   
-    gama_vmax = gama_vmax[gama_vmax['ZMAX'] >= 0.0]
-    
     print('Writing {}.'.format(opath))
 
-    gama_vmax.write(opath, format='fits', overwrite=True)
+    write_desitable(opath, vmax)
     
-    ##  Luminosity fn.
-    opath  = opath.replace('vmax', 'lumfn')
-    result = lumfn(gama_vmax)
+    ##  Luminosity function estimate
+    result = lumfn(vmax, d8=d8)
 
-    print('Writing {}.'.format(opath))
+    ##  Stepwise luminosity function estimate
+    result_stepwise = lumfn_stepwise(vmax, d8=d8) 
+    '''
+    if fdelta != None:
+        result_stepwise = renormalise_d8LF(tier, result_stepwise, fdelta, fdelta_zp, self_count=True)
+    '''
+    ##  Reference Schechter - finer binning                                                                                                                                                           
+    ref_result = ref_schechter(d8=d8)
+
+    ##  Write.
+    opath      = opath.replace('vmax', 'lumfn')
+
+    print(f'Writing {opath}')
+
+    header     = fits.Header()
+
+    hx         = fits.HDUList()
+    hx.append(fits.PrimaryHDU(header=header))
+    hx.append(fits.convenience.table_to_hdu(result))
+    hx.append(fits.convenience.table_to_hdu(result_stepwise))
+    hx.append(fits.convenience.table_to_hdu(ref_result))
+
+    hx.writeto(opath, overwrite=True)
     
-    result.write(opath, format='fits', overwrite=True)
-
-    return 0
+    return  0
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Generate Gold luminosity function.')
-    parser.add_argument('-f', '--field', type=str, help='Select equatorial GAMA field: G9, G12, G15', required=False, default=None)
-    parser.add_argument('-d', '--density_split', help='Trigger density split luminosity function.', action='store_true')
+    parser.add_argument('--log', help='Create a log file of stdout.', action='store_true')
+    parser.add_argument('--field', type=str, help='Select equatorial GAMA field: G9, G12, G15', default='G9')
+    parser.add_argument('--survey', help='Select survey', default='gama')
+    parser.add_argument('--density_split', help='Trigger density split luminosity function.', action='store_true')
     parser.add_argument('--dryrun', action='store_true', help='dryrun.')
-    parser.add_argument('--prefix', help='filename prefix', default='randoms')
-
     parser.add_argument('--nooverwrite',  help='Do not overwrite outputs if on disk', action='store_true')
+    parser.add_argument('--jackknife', help='Apply jack knife.', action='store_true')
+    parser.add_argument('--conservative', help='Conservative analysis choices', action='store_true')
     
-    args   = parser.parse_args()
+    args          = parser.parse_args()
 
-    field  = args.field
-    dryrun = args.dryrun
+    log           = args.log
+    field         = args.field.upper()
+    dryrun        = args.dryrun
+    survey        = args.survey
     density_split = args.density_split
-    prefix = args.prefix
-
-    if density_split:
-        assert  field != None
-        assert  'ddp1' in prefix
-
+    jackknife     = args.jackknife
+    conservative  = args.conservative
+    
     if not density_split:
+        if log:
+            logfile = findfile(ftype='lumfn', dryrun=False, survey=survey, log=True)
+            
+            print(f'Logging to {logfile}')
+                
+            sys.stdout = open(logfile, 'w')
+
         print('Generating Gold reference LF.')
+
+        call_signature(dryrun, sys.argv)
 
         # Bounded by gama gold, reference schechter limits:  
         # 0.039 < z < 0.263.
         # Note: not split by field. 
-        fpath = os.environ['GOLD_DIR'] + '/gama_gold_ddp.fits'
         
-        if dryrun:
-            fpath = fpath.replace('.fits', '_dryrun.fits')
+        fpath  = findfile(ftype='ddp_n8', dryrun=dryrun, survey=survey)
+        opath  = findfile(ftype='vmax',   dryrun=dryrun, survey=survey)
 
-        opath = fpath.replace('ddp', 'vmax')
-
-        # 
         if args.nooverwrite:
-            if os.path.isfile(opath) and os.path.isfile(opath.replace('vmax', 'lumfn')):
-                
-                print('{} found on disk and overwrite forbidden (--nooverwrite).'.format(fpath))
-                exit(0)
-            
-        '''
-        all_rpaths = [os.environ['RANDOMS_DIR'] + '/{}_bd_ddp_n8_G{}_0.fits'.format(prefix, ff) for ff in [9, 12, 15]]
-
-        if dryrun:
-            all_rpaths = [_rpath.replace('.fits', '_dryrun.fits') for _rpath in all_rpaths]
-        '''
+            overwrite_check(opath)
 
         print(f'Reading: {fpath}')
         print(f'Writing: {opath}')
 
-        process_cat(fpath, opath, rand_paths=[])
+        process_cat(fpath, opath, survey=survey, fillfactor=True)
+
+        if jackknife:
+            vmax                           = Table.read(opath)
+            rand_vmax                      = vmaxer_rand(survey=survey, ftype='randoms_bd_ddp_n8', dryrun=dryrun, prefix=prefix, conservative=conservative, write=False)
+
+            # Solve for jack knife limits.
+            njack, jk_volfrac, limits, jks = solve_jackknife(rand_vmax)
+
+            rand_vmax['JK']                = jks
+            rand_vmax.meta['NJACK']        = njack
+            rand_vmax.meta['JK_VOLFRAC']   = jk_volfrac
+
+            # Set jack knife limits to data.
+            vmax['JK']                     = set_jackknife(vmax['RA'], vmax['DEC'], limits=limits, debug=False)
+            vmax.meta['NJACK']             = njack
+            vmax.meta['JK_VOLFRAC']        = jk_volfrac
+
+            # Save jack knife limits.
+            jpath                          = findfile(ftype='jackknife', prefix=prefix, dryrun=dryrun)
+
+            with open(jpath, 'w') as ofile:
+                yaml.dump(dict(limits), ofile, default_flow_style=False)
+
+            print(f'Writing: {jpath}')
+
+            lpath                          = findfile(ftype='lumfn', dryrun=dryrun, survey=survey, prefix=prefix)
+            jackknife                      = np.arange(njack)
+
+            lumfn(vmax, jackknife=jackknife, opath=lpath)
+
+            print(f'Written {lpath}')
+
+            jackknife_mean(lpath)
+        
+        print('Done.')
+
+        if log:
+            sys.stdout.close()
 
     else:
+        if log:
+            # HACK
+            logfile = findfile(ftype='ddp_n8_d0_vmax', dryrun=False, field=field, survey=survey, log=True).replace('vmax', 'lumfn').replace('_{utier}', '')
+                        
+            print(f'Logging to {logfile}')
+        
+            sys.stdout = open(logfile, 'w')
+
         print('Generating Gold density-split LF.')
 
-        field = field.upper()
+        call_signature(dryrun, sys.argv)
 
-        rpath = os.environ['RANDOMS_DIR'] + '/{}_bd_ddp_n8_{}_0.fits'.format(prefix, field)
-        
-        if dryrun:
-            rpath = rpath.replace('.fits', '_dryrun.fits')
-                
+        assert  field != None        
+
         if dryrun:
             # A few galaxies have a high probability to be in highest density only. 
             utiers = np.array([8])
@@ -143,92 +188,116 @@ if __name__ == '__main__':
         else:
             utiers = np.arange(len(d8_limits))
                     
-        all_rands = None 
+        rand_vmax_all   = None 
 
         for idx in utiers:
-            ddp_idx   = idx + 1
+            print(f'\n\n\n\n----------------  Solving for density tier {idx}  ----------------\n\n')
 
             # Bounded by DDP1 z limits. 
-            ddp_fpath = os.environ['GOLD_DIR'] + '/gama_gold_{}_ddp_n8_d0_{:d}.fits'.format(field, idx)
-            ddp_opath = ddp_fpath.split('.')[0] + '_vmax.fits'
-            
-            if dryrun:
-                ddp_fpath = ddp_fpath.replace('.fits', '_dryrun.fits')
-                ddp_opath = ddp_opath.replace('.fits', '_dryrun.fits')
-
+            ddp_fpath                      = findfile(ftype='ddp_n8_d0', dryrun=dryrun, field=field, survey=survey, utier=idx)
+            ddp_opath                      = findfile(ftype='ddp_n8_d0_vmax', dryrun=dryrun, field=field, survey=survey, utier=idx)
+    
             print()
             print('Reading: {}'.format(ddp_fpath))
-            
-            failure = process_cat(ddp_fpath, ddp_opath, field=field, rand_paths=[rpath])
 
-            if failure:
-                print('FAILED on d0 tier {:d}; skipping.'.format(idx))
+            prefix                         = 'randoms_ddp1'
+            rpath                          = findfile(ftype='randoms_bd_ddp_n8', dryrun=dryrun, field=field, survey=survey, prefix=prefix)
 
-                continue
+            ##  Used for multi-field avg. of d8 lfs. 
+            fdelta_field                   = fetch_header(fpath=rpath, name='DDP1_d{}_VOLFRAC'.format(idx))
+
+            if rand_vmax_all == None:
+                print('Calculating multi-field volume fractions.')
+
+                rand_vmax_all              = vmaxer_rand(survey=survey, ftype='randoms_bd_ddp_n8', dryrun=dryrun, prefix=prefix, conservative=conservative, write=False)            
+
+            fdelta                         = float(rand_vmax_all.meta['DDP1_d{}_VOLFRAC'.format(idx)])
+            fdelta_zp                      = float(rand_vmax_all.meta['DDP1_d{}_ZEROPOINT_VOLFRAC'.format(idx)])
+
+            d8                             = float(rand_vmax_all.meta['DDP1_d{}_TIERMEDd8'.format(idx)])
+            d8_zp                          = float(rand_vmax_all.meta['DDP1_d{}_ZEROPOINT_TIERMEDd8'.format(idx)])
+
+            rand_vmax                      = rand_vmax_all[rand_vmax_all['DDP1_DELTA8_TIER'] == idx]
         
+            failure                        = process_cat(ddp_fpath, ddp_opath, fillfactor=True, tier=idx, d8=d8, fdelta=fdelta, fdelta_zp=fdelta_zp)
+
             print('LF process cat. complete.')
+
+            if failure == -99:
+                # Zero length (dryrun) catalog, nothing to be done.                                                                                                                                        
+                continue
+
+            if jackknife:
+                print('Solving for jack knife limits.')
+            
+                njack, jk_volfrac, limits, jks = solve_jackknife(rand_vmax)
+                
+                rand_vmax['JK']                = jks
+                rand_vmax.meta['NJACK']        = njack
+                rand_vmax.meta['JK_VOLFRAC']   = jk_volfrac
+
+                print('Setting data jack knife limits.')
+            
+                vmax_path                      = findfile(ftype='ddp_n8_d0_vmax', dryrun=dryrun, field=field, utier=idx, survey=survey)
+                vmax                           = Table.read(vmax_path, format='fits')
+            
+                vmax['JK']                     = set_jackknife(vmax['RA'], vmax['DEC'], limits=limits, debug=False)
+                vmax.meta['NJACK']             = njack
+                vmax.meta['JK_VOLFRAC']        = jk_volfrac
+
+                for ii in np.arange(1,2,1):
+                    # Fraction of DDP1 volume meeting completeness cut.   
+                    vmax.meta['DDP1_FULL8FRAC'] = rand_vmax_all.meta['DDP1_FULL8FRAC']
+
+                print('Writing jack knife limits yaml')
+
+                jpath                          = findfile(ftype='jackknife', prefix=prefix, dryrun=dryrun)
+            
+                with open(jpath, 'w') as jfile:
+                    yaml.dump(dict(limits), jfile, default_flow_style=False)
+
+                    jackknife                      = np.arange(njack)
+
+                print('Solving for jacked up luminosity functions.')
+
+                lumfn(vmax, jackknife=jackknife, opath=lpath)
+
+                print('Solving for jacked up luminosity function mean.')
+            
+                jackknife_mean(lpath)
+
+                # Reload result with JK columns.
+                result = Table.read(lpath)
+
+                with fits.open(lpath, mode='update') as hdulist:
+                    assert  hdulist[1].header['EXTNAME'] == 'LUMFN'
+
+                    hdulist[1] = result_hdu
+
+                    for i, hdu in enumerate(hdulist):
+                        hdr     = hdu.header
+
+                        if 'EXTNAME' not in hdu.header:
+                            continue
+
+                        if 'JK' in hdu.header['EXTNAME']:
+                            extname    = hdu.header['EXTNAME']
+
+                            print(f'Updating {extname}')
+
+                            result_jk  = Table(hdu.data, names=hdu.data.names)
+                            result_jk  = renormalise_d8LF(idx, result_jk, fdelta, fdelta_zp, self_count)
+                            result_jk  = fits.BinTableHDU(result_jk, name=extname, header=hdr)
+
+                            hdulist[i] = result_jk
+
+                        hdulist.append(ref_result_hdu)
                     
-            result = Table.read(ddp_opath.replace('vmax', 'lumfn'))        
-
-            # result.pprint()
-
-            if all_rands == None:
-                all_rpaths = [os.environ['RANDOMS_DIR'] + '/{}_bd_ddp_n8_G{}_0.fits'.format(prefix, ff) for ff in [9, 12, 15]]
-
-                if dryrun:
-                    all_rpaths = [_rpath.replace('.fits', '_dryrun.fits') for _rpath in all_rpaths]
-
-                all_rands = [Table.read(_x) for _x in all_rpaths]
-
-            # Calculated for DDP1 redshift limits. 
-            fdelta = np.array([x.meta['DDP1_d{}_VOLFRAC'.format(idx)] for x in all_rands])
-            d8     = np.array([x.meta['DDP1_d{}_TIERMEDd8'.format(idx)] for x in all_rands])
-
-            print('Field vol renormalization: {}'.format(fdelta))
-            print('Field d8  renormalization: {}'.format(d8))
-
-            fdelta = fdelta.mean()
-            d8     = d8.mean()
-
-            print('Found mean vol. renormalisation scale of {:.3f}'.format(fdelta))
-            print('Found mean  d8  renormalisation scale of {:.3f}'.format(d8))
+                    hdulist.flush()
+                    hdulist.close()
             
-            result = renormalise_d8LF(result, fdelta)
-            
-            result['REF_SCHECHTER']  = named_schechter(result['MEDIAN_M'], named_type='TMR')
-            result['REF_SCHECHTER'] *= (1. + d8) / (1. + 0.007)
+        print('Done.')
 
-            print('LF renormalization and ref. schechter complete.')
-            
-            result.pprint()
+        if log:
+            sys.stdout.close()
 
-            # 
-            sch_Ms = np.arange(-23., -15., 1.e-3)
-
-            sch    = named_schechter(sch_Ms, named_type='TMR')
-            sch   *= (1. + d8) / (1. + 0.007)
-
-            ##
-            ref_result = Table(np.c_[sch_Ms, sch], names=['MS', 'd{}_REFSCHECHTER'.format(idx)])            
-            ref_result.meta['DDP1_d{}_VOLFRAC'.format(idx)]   = fdelta
-            ref_result.meta['DDP1_d{}_TIERMEDd8'.format(idx)] = d8
-
-            print('Writing {}'.format(ddp_opath.replace('vmax', 'lumfn')))
-
-            primary_hdu    = fits.PrimaryHDU()
-
-            keys           = sorted(result.meta.keys())
-            
-            header         = {}
-            
-            for key in keys:
-                header[key] = str(result.meta[key])
-
-            hdr            = fits.Header(header)
-            result_hdu     = fits.BinTableHDU(result, name='LUMFN', header=hdr)
-            ref_result_hdu = fits.BinTableHDU(ref_result, name='REFERENCE')
-            hdul           = fits.HDUList([primary_hdu, result_hdu, ref_result_hdu])
-
-            hdul.writeto(ddp_opath.replace('vmax', 'lumfn'), overwrite=True, checksum=True)
-
-    print('Done.')

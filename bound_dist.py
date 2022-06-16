@@ -14,162 +14,196 @@ from   scipy.spatial   import KDTree
 from   astropy.table   import Table
 from   multiprocessing import Pool
 from   runtime         import calc_runtime
+from   findfile        import findfile, overwrite_check, call_signature
+from   config          import Configuration
+from   fillfactor      import collate_fillfactors
+from   params          import oversample_nrealisations, sphere_radius
 
-'''
-Script to calculate the maximum distance [Mpc/h] of each random from the boundary. 
-'''
+def process_one(run, pid=0):
+    split      = run[0]
+    complement = run[1]
+    '''                                                                                                                                                                                                   
+    try:                                                                                                                                                                                                  
+        pid  = multiprocessing.current_process().name.ljust(20)                                                                                                                                        
+                                                                                                                                                                                                        
+    except Exception as e:                                                                                                                                                                               
+        print(e)                                                                                                                                                                                           
+    '''
+    dd, ii     = complement.query(split, k=1)
 
-np.random.seed(314)
-
-parser = argparse.ArgumentParser(description='Find boundary distance for all randoms in a specified field..')
-parser.add_argument('-f', '--field', type=str, help='Select equatorial GAMA field: G9, G12, G15', required=True)
-parser.add_argument('-d', '--dryrun', help='Dryrun.', action='store_true')
-parser.add_argument('--prefix', help='filename prefix', default='randoms')
-parser.add_argument('--nooverwrite',  help='Do not overwrite outputs if on disk', action='store_true')
-
-args   = parser.parse_args()
-
-field  = args.field.upper()
-dryrun = args.dryrun
-prefix = args.prefix
-
-start  = time.time()
-
-# https://www.dur.ac.uk/icc/cosma/cosma5/
-nproc  = 16
-realz  = 0
-
-fpath  = os.environ['RANDOMS_DIR'] + '/{}_N8_{}_{:d}.fits'.format(prefix, field, realz)
-
-if dryrun:
-    fpath= fpath.replace('.fits', '_dryrun.fits')
-
-opath = fpath.replace('{}_N8'.format(prefix), '{}_bd'.format(prefix))
-    
-if args.nooverwrite:
-    if os.path.isfile(opath):
-        print('{} found on disk and overwrite forbidden (--nooverwrite).'.format(opath))
-        exit(0)
-
-# Output is sorted by fillfactor.py;   
-rand      = Table.read(fpath)
-
-runtime   = calc_runtime(start, 'Reading {:.2f}M randoms'.format(len(rand) / 1.e6), xx=rand)
-    
-body      = rand[rand['IS_BOUNDARY'] == 0]
-boundary  = rand[rand['IS_BOUNDARY'] == 1]
-
-split_idx = np.arange(len(body))
-splits    = np.array_split(split_idx, 10 * nproc)
-
-bids      = boundary['RANDID']
-
-boundary  = np.c_[boundary['CARTESIAN_X'], boundary['CARTESIAN_Y'], boundary['CARTESIAN_Z']]
-boundary  = np.array(boundary, copy=True)
-
-kd_tree   = KDTree(boundary)
-
-runtime   = calc_runtime(start, 'Created boundary tree.')
-
-# points  = np.c_[body['CARTESIAN_X'], body['CARTESIAN_Y'], body['CARTESIAN_Z']] 
-# points  = [x for x in points]
-# dd, ii  = kd_tree.query(points, k=1)
-
-del rand
-del boundary
-del split_idx
-
-gc.collect()
-
-'''
-local_vars = list(locals().items())                                                                                                                                                                  
-
-for var, obj in local_vars:                                                                                                                                                                           
-    print(var, sys.getsizeof(obj))                                                                                                                                                                   
-
-exit()
-'''
-
-runtime   = calc_runtime(start, 'Deleted rand.')
-
-def process_one(split, pid=0):
-    points = np.c_[body[split]['CARTESIAN_X'], body[split]['CARTESIAN_Y'], body[split]['CARTESIAN_Z']] 
-    points = [x for x in points]
-
-    try:
-        pid  = multiprocessing.current_process().name.ljust(20)
-
-    except Exception as e:
-        print(e)
-
-
-    # print('Querying boundary tree for split [{}...{}]'.format(split[0], split[-1]))
-    
-    dd, ii = kd_tree.query(points, k=1)
-    
-    del  points
+    # del  points                                                                                                                                                                                         
 
     return  dd.tolist(), ii.tolist()
 
-'''
-# Serial.
+def bound_dist(log, field, dryrun, prefix, survey, nproc, realz, nooverwrite, collate=True):
+    start  = time.time()
 
-result = []
+    if collate:
+        # Collate multiple n8 measurements from N>1 oversampled realizations into the 0th realization. 
+        # Note: null op if already applied.
+        collate_fillfactors(realzs=np.arange(oversample_nrealisations), field=field, survey=survey, dryrun=dryrun, prefix=prefix, write=True)
+    
+    # https://www.dur.ac.uk/icc/cosma/cosma5/
+    fpath  = findfile(ftype='randoms_n8', dryrun=dryrun, field=field, survey=survey, prefix=prefix)
+    opath  = findfile(ftype='randoms_bd', dryrun=dryrun, field=field, survey=survey, prefix=prefix)
 
-for split in splits:
-    result += process_one(split)
+    if log:
+        logfile = findfile(ftype='randoms_bd', dryrun=False, field=field, survey=survey, prefix=prefix, log=True)
 
-result = np.array(result)
-'''
+        print(f'Logging to {logfile}')
 
-runtime = calc_runtime(start, 'POOL:  Querying bound dist for body points.')
+        sys.stdout = open(logfile, 'w')
+    
+    if nooverwrite:
+        overwrite_check(opath)
 
-with Pool(nproc) as pool:
-    # result  = p.map(process_one, splits)
+    call_signature(dryrun, sys.argv)
 
-    results = []
+    # Output is sorted by fillfactor.py;   
+    body      = Table.read(fpath)
+    boundary  = Table.read(fpath, 'BOUNDARY')
 
-    for result in tqdm.tqdm(pool.imap(process_one, iterable=splits), total=len(splits)):
-        results.append(result)
+    body.sort('CARTESIAN_X')
+    boundary.sort('CARTESIAN_X')
 
-    pool.close()
-    pool.join()
+    bids      = boundary['BOUNDID']
+    boundary  = np.c_[boundary['CARTESIAN_X'], boundary['CARTESIAN_Y'], boundary['CARTESIAN_Z']]
+    
+    body      = np.c_[body['CARTESIAN_X'], body['CARTESIAN_Y'], body['CARTESIAN_Z']]
 
-runtime = calc_runtime(start, 'POOL:  Done with queries')
+    runtime   = calc_runtime(start, 'Reading {:.2f}M randoms'.format(len(body) / 1.e6), xx=body)
 
-flat_result = []
-flat_ii     = []
+    split_idx = np.arange(len(body))
+    split_idx = np.array_split(split_idx, 8 * nproc)
 
-for rr in results:
-    flat_result += rr[0]
-    flat_ii     += rr[1]
+    nchunk    = len(split_idx)
 
-rand = Table.read(fpath)
-rand['BOUND_DIST'] = 0.0
-rand['BOUND_ID']   = 0
+    runs      = []
 
-rand['BOUND_DIST'][rand['IS_BOUNDARY'] == 0] = np.array(flat_result)
-rand['BOUND_ID'][rand['IS_BOUNDARY'] == 0]   = bids[np.array(flat_ii)]
+    for i, idx in enumerate(split_idx):
+        split      = body[idx]
 
-sphere_radius = rand.meta['RSPHERE']
-rand['FILLFACTOR']   = np.clip(rand['FILLFACTOR'], 0., 1.)
-rand['FILLFACTOR'][rand['BOUND_DIST'].data > sphere_radius] = 1
+        xmin       = split[:,0].min()
+        xmax       = split[:,0].max()
 
-runtime = calc_runtime(start, 'Shuffling')
+        buff       = .2 # Mpc                                                                                                                                                                             
 
-# randomise rows.                                                                                                                                                
-idx  = np.arange(len(rand))
-idx  =  np.random.choice(idx, size=len(idx), replace=False)
+        # Boundary complement. 
+        # TODO HARDCODE                                                                                                                                                                                 
+        complement = (boundary[:,0] > (xmin - sphere_radius - buff)) & (boundary[:,0] < (xmax + sphere_radius + buff))
+        complement =  boundary[complement]
 
-rand = rand[idx]
+        cmin       = complement[:,0].min()
+        cmax       = complement[:,0].max()
+    
+        print('{:d}\t{:.4f}\t{:.4f}\t{:.4f}\t{:.4f}\t{:d}\t{:d}'.format(i, xmin, xmax, cmin, cmax, len(split), len(complement)))
 
-# Bound dist.
-# https://docs.scipy.org/doc/scipy/reference/generated/scipy.spatial.KDTree.query.html#scipy.spatial.KDTree.query
+        # leafsize=5                                                                                                                                                                                    
+        split      = [x for x in split]
+        complement = KDTree(complement)
 
-runtime = calc_runtime(start, 'Writing {}'.format(opath), xx=rand)
+        runs.append([split, complement])
 
-rand.write(opath, format='fits', overwrite=True)
+    runtime   = calc_runtime(start, 'Created boundary trees.')
 
-runtime   = calc_runtime(start, 'Finished')
+    runtime = calc_runtime(start, 'POOL:  Querying bound dist for body points of {} splits.'.format(nchunk))
+
+    now     = time.time()
+
+    results = [process_one(runs[0], pid=0)]
+
+    split_time  = time.time() - now
+    split_time /= 60.
+
+    runtime = calc_runtime(start, 'POOL:  Expected runtime of {:.3f}.'.format(nchunk * split_time))
+
+    # https://britishgeologicalsurvey.github.io/science/python-forking-vs-spawn/
+    with multiprocessing.get_context('spawn').Pool(nproc) as pool:
+        for result in tqdm.tqdm(pool.imap(process_one, iterable=runs[1:]), total=len(runs[1:])):
+            results.append(result)
+
+        pool.close()
+
+        # https://stackoverflow.com/questions/38271547/when-should-we-call-multiprocessing-pool-join
+        pool.join()
+
+    runtime = calc_runtime(start, 'POOL:  Done with queries')
+
+    flat_result = []
+    flat_ii     = []
+
+    for rr in results:
+        flat_result   += rr[0]
+        flat_ii       += rr[1]
+
+    rand               = Table.read(fpath)
+    rand.sort('CARTESIAN_X')
+
+    # print(len(rand))
+    # print(len(flat_result))
+
+    rand['BOUND_DIST'] = np.array(flat_result)
+    rand['BOUNDID']    = bids[np.array(flat_ii)]
+
+    rand['FILLFACTOR_POISSON'] = rand['FILLFACTOR']
+    rand['FILLFACTOR'][rand['BOUND_DIST'].data > sphere_radius] = 1.
+
+    # CHANGE:  Protect against exactly zero fillfactor (causes division errors). 
+    rand['FILLFACTOR'] = np.clip(rand['FILLFACTOR'], 1.e-99, None)
+
+    runtime = calc_runtime(start, 'Shuffling')
+
+    # randomise rows.                                                                                                                                                
+    idx  = np.arange(len(rand))
+    idx  = np.random.choice(idx, size=len(idx), replace=False)
+
+    rand = rand[idx]
+
+    # Bound dist.
+    # https://docs.scipy.org/doc/scipy/reference/generated/scipy.spatial.KDTree.query.html#scipy.spatial.KDTree.query
+
+    runtime  = calc_runtime(start, 'Writing {}'.format(opath), xx=rand)
+
+    rand.write(opath, format='fits', overwrite=True)
+
+    runtime = calc_runtime(start, 'Finished')
+
+    if log:
+        sys.stdout.close()
 
 
+if __name__ == '__main__':
+    '''                                                                                                                                                                                                    
+    Script to calculate the maximum distance [Mpc/h] of each random from the boundary.                                                                                                                  
+    '''
+
+    np.random.seed(314)
+
+    parser = argparse.ArgumentParser(description='Find boundary distance for all randoms in a specified field..')
+    parser.add_argument('--log', help='Create a log file of stdout.', action='store_true')
+    parser.add_argument('-f', '--field', type=str, help='Select equatorial GAMA field: G9, G12, G15', required=True)
+    parser.add_argument('-d', '--dryrun', help='Dryrun.', action='store_true')
+    parser.add_argument('-s', '--survey', help='Select survey.', default='gama')
+    parser.add_argument('--prefix', help='filename prefix', default='randoms')
+    parser.add_argument('--nooverwrite',  help='Do not overwrite outputs if on disk', action='store_true')
+    parser.add_argument('--config',       help='Path to configuration file', type=str, default=findfile('config'))
+    parser.add_argument('--nproc', type=int, help='Number of processors', default=12)
+    parser.add_argument('--realz', type=int, help='Realisation', default=0)
+
+    args        = parser.parse_args()
+    log         = args.log
+    field       = args.field.upper()
+    dryrun      = args.dryrun
+    prefix      = args.prefix
+    survey      = args.survey.lower()
+    nproc       = args.nproc
+    realz       = args.realz
+    nooverwrite = args.nooverwrite
+
+    '''                                                                                                                                                                                                 
+    config = Configuration(args.config)                                                                                                                                                              
+    config.update_attributes('bound_dist', args)                                                                                                                                                       
+    config.write()                                                                                                                                                                                        
+    '''
+    
+    bound_dist(log, field, dryrun, prefix, survey, nproc, realz, nooverwrite)

@@ -3,30 +3,56 @@ import fitsio
 import numpy             as np
 import matplotlib.pyplot as plt
 
+from   astropy.table     import Table
 from   cosmo             import volcom
 from   scipy.interpolate import interp1d
+from   findfile          import findfile
 
 
 tmr_DDP1       = [-21.8, -20.1]
 tmr_DDP2       = [-20.6, -19.3]
 tmr_DDP3       = [-19.6, -17.8]
 
-root           = os.environ['GOLD_DIR'] + '/ddrp_limits/'
+def initialise_ddplimits(survey, Mcol='M0P0_QALL', bright_idx=None, faint_idx=None):
+    if bright_idx == None:
+        bright_idx = 3
 
-_bright_curve  = fitsio.read(root + '/ddrp_limit_3.fits')  #  7 (12.0 QCOLOR 0.131)
-_faint_curve   = fitsio.read(root + '/ddrp_limit_17.fits') # 27 (19.8 QCOLOR 1.067)
+        assert Mcol == 'M0P0_QALL'
 
-# TODO: extend the curve limits and put bounds_error back on.
-bright_curve   = interp1d(_bright_curve['M0P0_QALL'], _bright_curve['Z'], kind='linear', copy=True, bounds_error=False, fill_value=0.0, assume_sorted=False)
-bright_curve_r = interp1d(_bright_curve['Z'],         _bright_curve['M0P0_QALL'], kind='linear', copy=True, bounds_error=False, fill_value=0.0, assume_sorted=False)
+    if  faint_idx == None:
+        faint_idx  = 17
 
-faint_curve    = interp1d(_faint_curve['M0P0_QALL'],  _faint_curve['Z'],  kind='linear', copy=True, bounds_error=False, fill_value=1.0, assume_sorted=False)
-faint_curve_r  = interp1d(_faint_curve['Z'],          _faint_curve['M0P0_QALL'],   kind='linear', copy=True, bounds_error=False, fill_value=1.0, assume_sorted=False)
+        assert Mcol == 'M0P0_QALL'
 
-def get_ddps(Area, M_0P0s, zs):
+    return _initialise_ddplimits(bright_idx, faint_idx, survey=survey)
+
+def _initialise_ddplimits(bright_idx, faint_idx, Mcol='M0P0_QALL', survey='gama'):
+    bpath          = findfile(ftype='ddp_limit', dryrun=False, survey=survey, ddp_count=bright_idx) 
+    fpath          = findfile(ftype='ddp_limit', dryrun=False, survey=survey, ddp_count=faint_idx) 
+
+    print(f'Reading {bpath}')
+    print(f'Reading {fpath}')
+
+    _bright_curve  = Table.read(bpath)
+    _faint_curve   = Table.read(fpath)
+
+    # TODO: extend the curve limits and put bounds_error back on.
+    bright_curve   = interp1d(_bright_curve[Mcol], _bright_curve['Z'],  kind='linear', copy=True, bounds_error=False, fill_value=0.0, assume_sorted=False)
+    bright_curve_r = interp1d(_bright_curve['Z'],  _bright_curve[Mcol], kind='linear', copy=True, bounds_error=False, fill_value=0.0, assume_sorted=False)
+
+    faint_curve    = interp1d(_faint_curve[Mcol],  _faint_curve['Z'],   kind='linear', copy=True, bounds_error=False, fill_value=1.0, assume_sorted=False)
+    faint_curve_r  = interp1d(_faint_curve['Z'],   _faint_curve[Mcol],  kind='linear', copy=True, bounds_error=False, fill_value=1.0, assume_sorted=False)
+
+    return  bright_curve, bright_curve_r, faint_curve, faint_curve_r
+
+def get_ddps(Area, M_0P0s, zs, survey):
     result   = np.zeros(len(zs) * 3, dtype=int).reshape(len(zs), 3)
+    resultz  = np.zeros(len(zs) * 3, dtype=int).reshape(len(zs), 3)
+
     zlims    = {}
     
+    bright_curve, bright_curve_r, faint_curve, faint_curve_r = initialise_ddplimits(survey=survey)
+
     for i, lims in enumerate([tmr_DDP1, tmr_DDP2, tmr_DDP3]):
         in_ddp  = (M_0P0s >= lims[0]) & (M_0P0s <= lims[1])
 
@@ -39,10 +65,11 @@ def get_ddps(Area, M_0P0s, zs):
         in_ddpz = ~exclude
         
         result[in_ddp, i] = 1
+        resultz[in_ddpz, i] = 1
 
         ddp_zs  = zs[in_ddp]
 
-        # print(zmin, zmax, len(ddp_zs))
+        print(zmin, zmax, len(ddp_zs))
         
         zmax = np.array([zmax, ddp_zs.max()]).min()
         zmin = np.array([zmin, ddp_zs.min()]).max()
@@ -57,8 +84,10 @@ def get_ddps(Area, M_0P0s, zs):
         zlims['DDP{}_NGAL'.format(i+1)] = np.count_nonzero(in_ddp) 
         zlims['DDP{}_DENS'.format(i+1)] = np.count_nonzero(in_ddp) / zlims['DDP{}_VZ'.format(i+1)] 
                 
-    return  result, zlims, faint_curve_r(zs)
+    return  result, resultz, zlims
 
 
-if __name__ == '__main__':
+if __name__ == '__main__':    
+    initialise_ddplimits('desi', Mcol='M0P0_QALL')
+
     print('Done.')

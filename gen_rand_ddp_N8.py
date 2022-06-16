@@ -1,5 +1,6 @@
 import os
 import gc
+import sys
 import time
 import tqdm
 import fitsio
@@ -12,46 +13,69 @@ from   scipy.spatial     import KDTree
 from   cartesian         import cartesian
 from   delta8_limits     import d8_limits, delta8_tier
 from   runtime           import calc_runtime
+from   findfile          import fetch_fields, findfile, overwrite_check
+from   config            import Configuration
+from   volfracs          import volfracs
+from   bitmask           import lumfn_mask, consv_mask, update_bit
+from   params            import fillfactor_threshold
 
 
 parser  = argparse.ArgumentParser(description='Calculate DDP1 N8 for all randoms.')
+parser.add_argument('--log', help='Create a log file of stdout.', action='store_true')
 parser.add_argument('-f', '--field', type=str, help='Select equatorial GAMA field: G9, G12, G15', required=True)
 parser.add_argument('-d', '--dryrun', help='Dryrun.', action='store_true')
 parser.add_argument('--prefix', help='filename prefix', default='randoms')
+parser.add_argument('--realz', help='randoms realization number', default=0)
 parser.add_argument('--nooverwrite',  help='Do not overwrite outputs if on disk', action='store_true')
+parser.add_argument('-s', '--survey', help='Select survey', default='gama')
 
-args    = parser.parse_args()
-field   = args.field.upper()
-dryrun  = args.dryrun
-prefix  = args.prefix
+args        = parser.parse_args()
+log         = args.log
+field       = args.field.upper()
+dryrun      = args.dryrun
+prefix      = args.prefix
+realz       = args.realz
+survey      = args.survey.lower()
+nooverwrite = args.nooverwrite
+
+fields      = fetch_fields(survey)
+
+if log:
+    logfile = findfile(ftype='randoms_bd_ddp_n8', dryrun=False, field=field, survey=survey, prefix=prefix, log=True)
+        
+    print(f'Logging to {logfile}')
+
+    sys.stdout = open(logfile, 'w')
+
+assert  field in fields, f'Provided {field} field is not compatible with those available for {survey} survey ({fields})'
 
 start   = time.time()
 
-realz   = 0
-
-fpath   = os.environ['GOLD_DIR'] + '/gama_gold_ddp.fits'
-
-if dryrun:
-    fpath = fpath.replace('.fits', '_dryrun.fits')
+fpath   = findfile(ftype='ddp', dryrun=dryrun, survey=survey, prefix=prefix)
 
 dat     = Table.read(fpath)
+dat     = dat[dat['FIELD'] == field]
 
 runtime = calc_runtime(start, 'Reading {:.2f}M Gold DDP'.format(len(dat) / 1.e6), xx=dat)
 
-fpath   = os.environ['RANDOMS_DIR'] + '/{}_bd_{}_{:d}.fits'.format(prefix, field, realz)
+fpath   = findfile(ftype='randoms_bd', dryrun=dryrun, field=field, survey=survey, prefix=prefix)
+opath   = findfile(ftype='randoms_bd_ddp_n8', dryrun=dryrun, field=field, survey=survey, prefix=prefix)
 
-if dryrun:
-    fpath = fpath.replace('.fits', '_dryrun.fits')
+if nooverwrite:
+    overwrite_check(opath)
 
-opath   = fpath.replace('bd', 'bd_ddp_n8')
-
-if args.nooverwrite:
-    if os.path.isfile(opath):
-        print('{} found on disk and overwrite forbidden (--nooverwrite).'.format(opath))
-        exit(0)
-    
+# Should be solid angle and DDP1 z-limit defined randoms.     
 rand    = Table.read(fpath)
 runtime = calc_runtime(start, 'Reading {:.2f}M randoms'.format(len(rand) / 1.e6), xx=rand)
+
+# Remove anything already in randoms header. 
+present = list(dat.meta.keys()) 
+
+for pp in present:
+    if pp in rand.meta.keys():
+        del dat.meta[pp]
+
+assert 'AREA' not in dat.meta.keys()
 
 # Propagate header 'DDP1_ZMIN' etc. to randoms.
 rand.meta.update(dat.meta)
@@ -65,6 +89,7 @@ del points
 
 gc.collect()
 
+# Calculate DDP1/2/3 8-sphere counts for each random. 
 for idx in range(3):
     ddp_idx      = idx + 1
 
@@ -79,8 +104,6 @@ for idx in range(3):
 
     rand['DDP{:d}_N8'.format(ddp_idx)] = np.array([len(idx) for idx in indexes_ddp])
                                       
-rand.meta['VOL8']   = (4./3.)*np.pi*(8.**3.)
-
 ddp1_zmin           = dat.meta['DDP1_ZMIN']
 ddp1_zmax           = dat.meta['DDP1_ZMAX']
 
@@ -90,36 +113,44 @@ ddp2_zmax           = dat.meta['DDP2_ZMAX']
 ddp3_zmin           = dat.meta['DDP3_ZMIN']
 ddp3_zmax           = dat.meta['DDP3_ZMAX']
 
-rand['IN_DDP1']     = (rand['Z'].data > ddp1_zmin) & (rand['Z'].data < ddp1_zmax)
-rand['IN_DDP2']     = (rand['Z'].data > ddp2_zmin) & (rand['Z'].data < ddp2_zmax)
-rand['IN_DDP3']     = (rand['Z'].data > ddp3_zmin) & (rand['Z'].data < ddp3_zmax)
+print('Found redshift limits: {:.3f} < z < {:.3f}'.format(ddp1_zmin, ddp1_zmax))
 
-rand['DDP1_DELTA8'] = (rand['DDP1_N8'] / (rand.meta['VOL8'] * dat.meta['DDP1_DENS']) / rand['FILLFACTOR']) - 1.
-rand['DDP2_DELTA8'] = (rand['DDP2_N8'] / (rand.meta['VOL8'] * dat.meta['DDP2_DENS']) / rand['FILLFACTOR']) - 1.
-rand['DDP3_DELTA8'] = (rand['DDP3_N8'] / (rand.meta['VOL8'] * dat.meta['DDP3_DENS']) / rand['FILLFACTOR']) - 1.
+rand['DDPZLIMS']      = np.zeros(len(rand) * 3, dtype=int).reshape(len(rand), 3)
 
-rand['DDP1_DELTA8_TIER'] = delta8_tier(rand['DDP1_DELTA8'])
+rand['DDPZLIMS'][:,0] = (rand['Z'].data > ddp1_zmin) & (rand['Z'].data < ddp1_zmax)
+rand['DDPZLIMS'][:,1] = (rand['Z'].data > ddp2_zmin) & (rand['Z'].data < ddp2_zmax)
+rand['DDPZLIMS'][:,2] = (rand['Z'].data > ddp3_zmin) & (rand['Z'].data < ddp3_zmax)
+
+rand['DDP1_DELTA8']   = (rand['DDP1_N8'] / (rand.meta['VOL8'] * dat.meta['DDP1_DENS']) / rand['FILLFACTOR']) - 1.
+rand['DDP2_DELTA8']   = (rand['DDP2_N8'] / (rand.meta['VOL8'] * dat.meta['DDP2_DENS']) / rand['FILLFACTOR']) - 1.
+rand['DDP3_DELTA8']   = (rand['DDP3_N8'] / (rand.meta['VOL8'] * dat.meta['DDP3_DENS']) / rand['FILLFACTOR']) - 1.
+
+rand['DDP1_DELTA8_TIER']      = delta8_tier(rand['DDP1_DELTA8'].data)
+
+# Same again, but random included in sphere-8 count for volume fractions used within DDP1 magnitude limits.
+rand['DDP1_DELTA8_ZEROPOINT'] = ((1 + rand['DDP1_N8']) / (rand.meta['VOL8'] * dat.meta['DDP1_DENS']) / rand['FILLFACTOR']) - 1.
+rand['DDP2_DELTA8_ZEROPOINT'] = ((1 + rand['DDP2_N8']) / (rand.meta['VOL8'] * dat.meta['DDP2_DENS']) / rand['FILLFACTOR']) - 1.
+rand['DDP3_DELTA8_ZEROPOINT'] = ((1 + rand['DDP3_N8']) / (rand.meta['VOL8'] * dat.meta['DDP3_DENS']) / rand['FILLFACTOR']) - 1.
+
+rand['DDP1_DELTA8_TIER_ZEROPOINT'] = delta8_tier(rand['DDP1_DELTA8_ZEROPOINT'])
+
+# Meeting sphere-completeness cut.  Ultimately, this will correct VMAX from solid angle and DDP1                                                                                                         
+# redshift limits to that meeting the completeness cut (in volume).                                                                                                                                        
+update_bit(rand['IN_D8LUMFN'], lumfn_mask, 'FILLFACTOR', rand['FILLFACTOR'].data < fillfactor_threshold)
+
+print('Fraction of randoms meeting IN_D8LUMFN cut: {}'.format(np.mean(rand['IN_D8LUMFN'])))
 
 for ii, xx in enumerate(d8_limits):
     rand.meta['D8{}LIMS'.format(ii)] = str(xx)
 
-utiers    = np.unique(rand['DDP1_DELTA8_TIER'].data)
-
-print('Unique tiers: {}'.format(utiers))
-print('Found redshift limits: {:.3f} < z < {:.3f}'.format(ddp1_zmin, ddp1_zmax))
-
-for ut in utiers:    
-    ddp1_rand = rand[rand['IN_DDP1']]
-    in_tier   = (ddp1_rand['DDP1_DELTA8_TIER'].data == ut)
-        
-    rand.meta['DDP1_d{}_VOLFRAC'.format(ut)]   = np.mean(in_tier)
-    rand.meta['DDP1_d{}_TIERMEDd8'.format(ut)] = np.median(ddp1_rand['DDP1_DELTA8'].data[in_tier])
-
-    print('DDP1_d{}_VOLFRAC OF {:.4f} ADDED.'.format(ut, np.mean(in_tier)))
-    print('DDP1_d{}_TIERMEDd8 OF {:.4f} ADDED.'.format(ut, rand.meta['DDP1_d{}_TIERMEDd8'.format(ut)]))
+# Single-field values defined in header.
+rand    = volfracs(rand, bitmasks=['IN_D8LUMFN'])
         
 runtime = calc_runtime(start, 'Writing {}'.format(opath), xx=rand)
 
 rand.write(opath, format='fits', overwrite=True)
 
 runtime = calc_runtime(start, 'Finished')
+
+if log:
+    sys.stdout.close()

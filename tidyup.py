@@ -1,28 +1,32 @@
 import os
 import sys
+import yaml
 
-from   findfile import file_check, fields
+from   findfile import file_check, findfile, fetch_header, supported
+from   config   import smart_open, CustomDumper
 
+def diagnose():
+   result = fetch_header(allsupported=True)
 
-DRYRUN  = os.environ['DRYRUN']
-GOLDDIR = os.environ['GOLD_DIR']
-RANDDIR = os.environ['RANDOMS_DIR']
+   for key in result.keys():
+      with smart_open() as fh:
+         yaml.dump(result[key], fh, default_flow_style=False, sort_keys=False)
+         fh.write('\n')
+
+def summary(fpath=None):
+    if not fpath:
+        fpath = findfile('summary_log')
+    
+    smart_open(fpath)
+    
+    diagnose()
+
+    file_check()  
 
 def tidyup():
-    # File check summary. 
-    sys.stdout = open(GOLDDIR + 'summary.log', 'w')
+    summary()
 
-    file_check()
-
-    sys.stdout.close()
-
-    # Gather Randoms and write to disk. 
-    #
-    # fpaths   = findfile('ddp_n8_d0', dryrun=False, prefix='', field=fields, utier=6)
-    # all_cats = gather_cat(fpaths)
-    # all_cats.pprint()
-
-    
 if __name__ == '__main__':
-    tidyup()
+   tidyup()
 
+   print('\n\nDone.\n\n')

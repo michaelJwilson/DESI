@@ -1,200 +1,274 @@
 import os
+import sys
 import time
 import numpy as np
 import argparse
 
-from   cosmo import cosmo, volcom
+from   cosmo             import cosmo, volcom
 from   scipy.interpolate import interp1d
-from   gama_limits import gama_limits, fields
-from   astropy.table import Table
-from   cartesian import cartesian, rotate
-from   gama_limits import gama_field
-from   runtime import calc_runtime
-from   desi_randoms import desi_randoms
+from   astropy.table     import Table
+from   cartesian         import cartesian, rotate
+from   runtime           import calc_runtime
+from   desi_randoms      import desi_randoms
+from   findfile          import fetch_fields, findfile, overwrite_check, call_signature
+from   gama_limits       import gama_limits, gama_field
+from   ddp_zlimits       import ddp_zlimits
+from   config            import Configuration
+from   params            import oversample_nrealisations
 
 
-np.random.seed(314)
+def randoms(field='G9', survey='gama', density=1., zmin=ddp_zlimits['DDP1'][0], zmax=ddp_zlimits['DDP1'][1], dryrun=False, prefix='', seed=None, oversample=2, realz=0):
+    start   = time.time()
 
-parser  = argparse.ArgumentParser(description='Select GAMA field.')
-parser.add_argument('-f', '--field',  type=str, help='select GAMA field [G9, G12, G15] or DESI rosette [R1...]', required=True)
-parser.add_argument('-d', '--dryrun', help='Dryrun.', action='store_true')
-parser.add_argument('-s', '--survey', help='Survey, e.g. GAMA, DESI, etc.', type=str)
-parser.add_argument('--realz',        help='Realization', default=0, type=np.int)
-parser.add_argument('--prefix',       help='filename prefix', default='randoms')
-parser.add_argument('--nooverwrite',  help='Do not overwrite outputs if on disk', action='store_true')
+    fields  = fetch_fields(survey)
 
-# Defaults to GAMA Gold limits. 
-parser.add_argument('--zmin', type=np.float32, help='Minimum redshift limit', default=0.039)
-parser.add_argument('--zmax', type=np.float32, help='Maximum redshift limit', default=0.263)
+    assert  field in fields, f'Provided {field} field is not compatible with those available for {survey} survey ({fields})'
 
-args    = parser.parse_args()
-field   = args.field.upper()
-dryrun  = args.dryrun
-survey  = args.survey
-zmin    = args.zmin
-zmax    = args.zmax
-prefix  = args.prefix 
-realz   = args.realz
+    opath   = findfile(ftype='randoms', dryrun=dryrun, field=field, survey=survey, prefix=prefix, realz=realz, oversample=oversample)
 
-start   = time.time()
+    if args.nooverwrite:
+        overwrite_check(opath)
 
-##  ras and decs.                                                                                                                                                              
-if survey == 'GAMA':
-    Area    = 60.
+    if seed == None:
+        seed = seed + realz + 50 * oversample
 
-    # TODO:
-    # field   = fields[args.field]
+    np.random.seed(seed)
+
+    call_signature(dryrun, sys.argv)
+
+    print('Solving for redshift limits: {} < z < {}.'.format(zmin, zmax))
+
+    ##  ras and decs.                                                                                                                                                              
+    if survey == 'gama':    
+        Area       = 60.
+
+        ra_min     = gama_limits[field]['ra_min']
+        ra_max     = gama_limits[field]['ra_max']
+
+        dec_min    = gama_limits[field]['dec_min']
+        dec_max    = gama_limits[field]['dec_max']
+
+        ctheta_min = np.cos(np.pi/2. - np.radians(dec_min))
+        ctheta_max = np.cos(np.pi/2  - np.radians(dec_max))
+
+        vol        = volcom(zmax, Area) - volcom(zmin, Area)
+
+        nrand      = int(np.ceil(vol * density * oversample))
+        
+        cos_theta  = np.random.uniform(ctheta_min, ctheta_max, nrand)
+        theta      = np.arccos(cos_theta)
+        decs       = np.pi/2. - theta
+        decs       = np.degrees(decs)
+
+        ras        = np.random.uniform(ra_min, ra_max, nrand)
+
+        randoms    = Table(np.c_[ras, decs], names=['RANDOM_RA', 'RANDOM_DEC'])
+        nrand      = len(randoms)
+        
+        if dryrun:
+            # Dryrun:  2x2 sq. patch of sky.  
+            # G12
+            delta_deg = 0.5
+ 
+            isin    = (randoms['RANDOM_RA'] > 180. - delta_deg) & (randoms['RANDOM_RA'] < 180. + delta_deg)
+            isin   &= (randoms['RANDOM_DEC'] > 0. - delta_deg) & (randoms['RANDOM_DEC'] < 0. + delta_deg)
+
+            allin  = isin
+
+            # G9                                                                                                                                                                                       
+            isin   = (randoms['RANDOM_RA']  > 135. - delta_deg) & (randoms['RANDOM_RA']  < 135. + delta_deg)
+            isin  &= (randoms['RANDOM_DEC'] > 0. - delta_deg) & (randoms['RANDOM_DEC'] < 0. + delta_deg)
+
+            allin |= isin
+
+            # G15                                                                                                                                                                                         
+            isin   = (randoms['RANDOM_RA']  > 217. - delta_deg) & (randoms['RANDOM_RA']  < 217. + delta_deg)
+            isin  &= (randoms['RANDOM_DEC'] > 0.0 - delta_deg) & (randoms['RANDOM_DEC'] < 0.0 + delta_deg)
+            
+            allin |= isin
+
+            randoms = randoms[allin]
+            nrand   = len(randoms)
+            
+    elif survey == 'desi':
+        if 'NERSC_HOST' in os.environ.keys():
+            # Support to run on nersc only.
+            randoms = desi_randoms(int(field[1:]), oversample=oversample, dryrun=dryrun)
+
+            nrand   = randoms.meta['NRAND']
+            Area    = randoms.meta['AREA']
+            
+        elif 'ddp1' in prefix:
+            rpath   = findfile(ftype='randoms', dryrun=dryrun, field=field, survey=survey, prefix=None, realz=realz, oversample=oversample)
+            randoms = Table.read(rpath)
+
+            nrand   = randoms.meta['NRAND']
+            Area    = randoms.meta['AREA']
+            
+        else:
+            print(f'As you are not running on nersc, the output of this script is assumed to be present at {opath} for dryrun: {dryrun}.')
+            return 0
+
+    else:
+        raise  NotImplementedError(f'No implementation for survey: {survey}')
     
-    ra_min  = gama_limits[field]['ra_min']
-    ra_max  = gama_limits[field]['ra_max']
+    ##  Vs and zs.
+    dz       = 1.e-4
 
-    dec_min = gama_limits[field]['dec_min']
-    dec_max = gama_limits[field]['dec_max']
+    Vmin     = volcom(zmin, Area)
+    Vmax     = volcom(zmax, Area)
 
-    ctheta_min = np.cos(np.pi/2. - np.radians(dec_min))
-    ctheta_max = np.cos(np.pi/2  - np.radians(dec_max))
+    vol      = Vmax - Vmin
 
-    cos_theta = np.random.uniform(ctheta_min, ctheta_max, nrand)
-    theta     = np.arccos(cos_theta)
-    decs      = np.pi/2. - theta
-    decs      = np.degrees(decs)
+    density  = nrand / vol
 
-    ras       = np.random.uniform(ra_min, ra_max, nrand)
+    rand_dir = os.path.dirname(opath)
+        
+    if not os.path.isdir(rand_dir):
+        print('Creating {}'.format(rand_dir))
 
-    ## TODO: move rand_density into different file and call?
-    rand_density = 2.
-    vol       = volcom(zmax, Area) - volcom(zmin, Area)
+        os.makedirs(rand_dir)
 
-    nrand     = np.int64(np.ceil(vol * rand_density))
+    print('Volume [1e6]: {:.2f}; oversample: {:.2f};  density: {:.2e}; nrand [1e6]: {:.2f}'.format(vol/1.e6, oversample, density, nrand / 1.e6))
 
-    randoms   = Table(np.c_[ras, decs], names=['RANDOM_RA', 'RANDOM_DEC'])
+    zs       = np.arange(0.0, zmax+dz, dz)
+    Vs       = volcom(zs, Area) 
+
+    # https://docs.scipy.org/doc/scipy/reference/generated/scipy.interpolate.interp1d.html
+    Vz       = interp1d(Vs, zs, kind='linear', copy=True, bounds_error=True, fill_value=np.NaN, assume_sorted=False)
+
+    Vdraws   = np.random.uniform(0., 1., nrand)
+    Vdraws   = Vmin + Vdraws * (Vmax - Vmin)
+
+    zs       = Vz(Vdraws)
+
+    print('Solved {:d} for field {}'.format(nrand, field))
+
+    ras               = randoms['RANDOM_RA']
+    decs              = randoms['RANDOM_DEC']
+
+    randoms['Z']      = zs
+    randoms['V']      = Vdraws
+    randoms['RANDID'] = np.arange(len(randoms))
+
+    randoms['FIELD']      = field
+
+    # TODO/HACK/RESTORE
+    randoms['GAMA_FIELD'] = gama_field(ras, decs)
+
+    print('Applying rotation.')
+
+    xyz      = cartesian(ras, decs, zs)
+
+    randoms['CARTESIAN_X'] = xyz[:,0]
+    randoms['CARTESIAN_Y'] = xyz[:,1]
+    randoms['CARTESIAN_Z'] = xyz[:,2]
+
+    xyz      = rotate(randoms['RANDOM_RA'], randoms['RANDOM_DEC'], xyz)
+
+    randoms['ROTCARTESIAN_X'] = xyz[:,0]
+    randoms['ROTCARTESIAN_Y'] = xyz[:,1]
+    randoms['ROTCARTESIAN_Z'] = xyz[:,2]
+
+    '''
+    elif survey == 'desi':    
+        randoms['IS_BOUNDARY'][randoms['ROS_DIST']   > np.percentile(randoms['ROS_DIST'],   100. - boundary_percent)] = 1
+        randoms['IS_BOUNDARY'][randoms['ROS_DIST']   < np.percentile(randoms['ROS_DIST'],   boundary_percent)]        = 1
+    '''
+
+    randoms['ZSURV']          = randoms['Z']
+    randoms['CONSERVATIVE']   = np.zeros_like(randoms['FIELD'], dtype=int)
+
+    if 'IN_D8LUMFN' not in randoms.dtype.names:
+        randoms['IN_D8LUMFN'] = np.zeros_like(randoms['FIELD'], dtype=int)
+
+    updates      = {'ZMIN':   zmin,\
+                    'ZMAX':   zmax,\
+                    'DZ':       dz,\
+                    'NRAND': nrand,\
+                    'FIELD': field,\
+                    'AREA':   Area,\
+                    'VOL':     vol,\
+                    'RAND_DENS': density,\
+                    'VOL8': (4./3.)*np.pi*(8.**3.),\
+                    'OVERSAMPLE': oversample,\
+                    'SEED': seed,\
+                    'PREFIX': prefix,\
+                    'REALZ': realz,\
+                    'FPATH': opath}
+
+    randoms.meta.update(updates)
+
+    randoms.meta['NRAND8']      = randoms.meta['VOL8'] * randoms.meta['RAND_DENS']
+    randoms.meta['NRAND8_PERR'] = np.sqrt(randoms.meta['NRAND8'])
+
+    for key in randoms.meta.keys():
+        print(key, randoms.meta[key])
+
+    runtime = calc_runtime(start, 'Writing {}'.format(opath), xx=randoms)
+
+    randoms.write(opath, format='fits', overwrite=True)
+
+    runtime = calc_runtime(start, 'Finished'.format(opath))
+
+    return 0
+
+
+if __name__ == '__main__':
+    parser  = argparse.ArgumentParser(description='Select GAMA field.')
+    parser.add_argument('--log', help='Create a log file of stdout.', action='store_true')
+    parser.add_argument('-f', '--field',  type=str, help='select GAMA field [G9, G12, G15] or DESI rosette [R1...]', default='G9')
+    parser.add_argument('-d', '--dryrun', help='Dryrun.', action='store_true')
+    parser.add_argument('-s', '--survey', help='Survey, e.g. GAMA, DESI, etc.', type=str, default='gama')
+    parser.add_argument('--realz',        help='Realization', default=0, type=int)
+    parser.add_argument('--prefix',       help='filename prefix', default='randoms')
+    parser.add_argument('--config',       help='Path to configuration file', type=str, default=findfile('config'))
+    parser.add_argument('--nooverwrite',  help='Do not overwrite outputs if on disk', action='store_true')
+    parser.add_argument('--density',      help='Random density per (Mpc/h)^3', default=1., type=float)
+    parser.add_argument('--oversample',   help='Oversampling factor for fillfactor counting.', default=2, type=int)
+    parser.add_argument('--seed',         help='Random seed.', default=0, type=int)
     
-elif survey == 'DESI':
-    # TODO:  field is useless, interpret as ros?
-    randoms   = desi_randoms(field)
-    nrand     = len(randoms)
+    # Defaults to GAMA Gold limits. 
+    parser.add_argument('--zmin', type=float, help='Minimum redshift limit', default=ddp_zlimits['DDP1'][0])
+    parser.add_argument('--zmax', type=float, help='Maximum redshift limit', default=ddp_zlimits['DDP1'][1])
 
-    # Original density of 2500 per sq. deg. 
-    Area      = nrand / 2500. 
+    args       = parser.parse_args()
+    log        = args.log
+    field      = args.field.upper()
+    dryrun     = args.dryrun
+    survey     = args.survey.lower()
+    zmin       = args.zmin
+    zmax       = args.zmax
+    prefix     = args.prefix 
+    realz      = args.realz
+    seed       = args.seed
 
-else:
-    raise  NotImplementedError(f'No implementation for survey: {survey}')
+    density    = args.density
+    oversample = args.oversample
 
+    assert oversample < 9, f'Oversample of {oversample} is not supported.'
+    assert realz < oversample_nrealisations, f'Provided realization number is inconsistent with that expected in params; consult there and bin/rand_pipeline scripts.'
 
-##  Vs and zs.
-dz      = 1.e-4
+    if log:
+        logfile    = findfile(ftype='randoms', dryrun=False, field=field, survey=survey, prefix=prefix, realz=realz, log=True)
 
-Vmin    = volcom(zmin, Area)
-Vmax    = volcom(zmax, Area)
+        print(f'Logging to {logfile}')
 
-vol     = Vmax - Vmin
+        sys.stdout = open(logfile, 'w')
+    '''
+    config = Configuration(args.config)
+    config.update_attributes('randoms', args)
+    config.write()
+    '''
+    for xx in [1, oversample]:        
+        seed      = seed
 
-rand_density = nrand / vol
+        # only generate independent realizations for oversample.
+        if oversample > 1:
+            seed += realz
+            seed += 50 * oversample
 
-##  IO: findfile. 
-opath     = os.environ['RANDOMS_DIR'] + '/{}_{}_{:d}.fits'.format(prefix, field, realz)
+        randoms(field=field, survey=survey, density=density, zmin=zmin, zmax=zmax, dryrun=dryrun, prefix=prefix, seed=seed, oversample=xx, realz=realz)
 
-if dryrun:
-    nrand = 500
-    opath = opath.replace('.fits', '_dryrun.fits')
-
-if args.nooverwrite:
-    if os.path.isfile(opath):
-        print('{} found on disk and overwrite forbidden (--nooverwrite).'.format(opath))
-        exit(0)
-
-if not os.path.isdir(os.environ['RANDOMS_DIR']):
-    print('Creating {}'.format(os.environ['RANDOMS_DIR']))
-
-    os.makedirs(os.environ['RANDOMS_DIR'])
-    
-print('Volume [1e6]: {:.2f}; rand_density: {:.2e}; nrand [1e6]: {:.2f}'.format(vol/1.e6, rand_density, nrand / 1.e6))
-
-boundary_percent = 1.
-
-zs      = np.arange(0.0, zmax+dz, dz)
-Vs      = volcom(zs, Area) 
-
-# https://docs.scipy.org/doc/scipy/reference/generated/scipy.interpolate.interp1d.html
-Vz      = interp1d(Vs, zs, kind='linear', copy=True, bounds_error=True, fill_value=np.NaN, assume_sorted=False)
-
-Vdraws  = np.random.uniform(0., 1., nrand)
-Vdraws  = Vmin + Vdraws * (Vmax - Vmin)
-
-zs      = Vz(Vdraws)
-
-print('Solved {:d} for field {}'.format(nrand, field))
-
-print('Applying rotation.')
-
-ras      = randoms['RANDOM_RA']
-decs     = randoms['RANDOM_DEC']
-
-xyz      = cartesian(ras, decs, zs)
-
-ras      = ras.astype(np.float32)
-decs     = decs.astype(np.float32)
-zs       = zs.astype(np.float32)
-Vdraws   = Vdraws.astype(np.float32)
-xyz      = xyz.astype(np.float32)
-
-randoms['Z'] = zs
-randoms['V'] = Vdraws
-randoms['RANDID'] = np.arange(len(randoms))
-randoms['FIELD']  = gama_field(ras, decs)
-
-# assert  np.all(randoms['FIELD'].data == field)
-
-randoms['CARTESIAN_X'] = xyz[:,0]
-randoms['CARTESIAN_Y'] = xyz[:,1]
-randoms['CARTESIAN_Z'] = xyz[:,2]
-
-xyz = rotate(randoms['RANDOM_RA'], randoms['RANDOM_DEC'], xyz)
-
-randoms['ROTCARTESIAN_X'] = xyz[:,0]
-randoms['ROTCARTESIAN_Y'] = xyz[:,1]
-randoms['ROTCARTESIAN_Z'] = xyz[:,2]
-
-print('Applying boundary.')
-
-
-randoms['IS_BOUNDARY'] = 0
-
-if survey == 'GAMA':
-    randoms['IS_BOUNDARY'][randoms['RANDOM_RA']  > np.percentile(randoms['RANDOM_RA'],  100. - boundary_percent)] = 1
-    randoms['IS_BOUNDARY'][randoms['RANDOM_RA']  < np.percentile(randoms['RANDOM_RA'],  boundary_percent)]        = 1
-
-    randoms['IS_BOUNDARY'][randoms['RANDOM_DEC'] > np.percentile(randoms['RANDOM_DEC'], 100. - boundary_percent)] = 1
-    randoms['IS_BOUNDARY'][randoms['RANDOM_DEC'] < np.percentile(randoms['RANDOM_DEC'], boundary_percent)]        = 1
-
-elif survey == 'DESI':    
-    randoms['IS_BOUNDARY'][randoms['ROS_DIST']   > np.percentile(randoms['ROS_DIST'],   100. - boundary_percent)] = 1
-    randoms['IS_BOUNDARY'][randoms['ROS_DIST']   < np.percentile(randoms['ROS_DIST'],   boundary_percent)]        = 1
-    
-else:
-    raise  NotImplementedError(f'No implementation for survey: {survey}')    
-
-randoms['IS_BOUNDARY'][randoms['V'] >= np.percentile(randoms['V'], 100. - boundary_percent)] = 1
-randoms['IS_BOUNDARY'][randoms['V'] <= np.percentile(randoms['V'],  boundary_percent)] = 1
-
-randoms.meta = {'ZMIN': zmin,\
-                'ZMAX': zmax,\
-                'DZ':     dz,\
-                'NRAND': nrand,\
-                'FIELD': field,\
-                'Area': Area,\
-                'BOUND_PERCENT': boundary_percent,\
-                'VOL': vol,\
-                'RAND_DENS': rand_density,\
-                'VOL8': (4./3.)*np.pi*(8.**3.)}
-
-randoms.meta['NRAND8']      = randoms.meta['VOL8'] * randoms.meta['RAND_DENS']
-randoms.meta['NRAND8_PERR'] = np.sqrt(randoms.meta['NRAND8'])
-
-print(randoms.meta)
-
-runtime = calc_runtime(start, 'Writing {}'.format(opath), xx=randoms)
-
-randoms.write(opath, format='fits', overwrite=True)
-
-runtime = calc_runtime(start, 'Finished'.format(opath))
+    if log:
+        sys.stdout.close()

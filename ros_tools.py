@@ -20,7 +20,7 @@ def tile2rosette(tile):
         if tile > 480:
             return tile//30    
 
-    return 999999
+    return -999999
 
 roscen = {0:(150.100,2.182),\
           1:(179.6,0),\
@@ -54,3 +54,11 @@ def calc_rosr(rosn, ra, dec):
     ad       = np.arccos(cd)*180./np.pi
 
     return  ad
+
+def ros_limits(dryrun):
+    if dryrun:
+        limits                = [0.9, 1.10]
+    else:
+        limits                = [0.2, 1.75]
+        
+    return limits

@@ -28,25 +28,25 @@ def cartesian(ras, decs, zs, rotate=False):
     mean_phi   = np.median(phi)
     mean_theta = np.median(theta)
     
-    chis  = cosmo.comoving_distance(zs).value # Mpc/h
+    chis       = cosmo.comoving_distance(zs).value # [Mpc/h].
 
-    zs    = chis * np.cos(theta)
-    ys    = chis * np.sin(theta) * np.sin(phi)
-    xs    = chis * np.sin(theta) * np.cos(phi)
+    zs         = chis * np.cos(theta)
+    ys         = chis * np.sin(theta) * np.sin(phi)
+    xs         = chis * np.sin(theta) * np.cos(phi)
 
-    pos   = np.c_[xs, ys, zs]
+    pos        = np.c_[xs, ys, zs]
 
     if rotate:
-        pos = rotate(ras, decs, pos)
+        pos    = rotate(ras, decs, pos)
 
     return  pos
 
 
 if __name__ == '__main__':
-    ras = np.random.uniform(10., 20., 100)
+    ras  = np.random.uniform(10., 20., 100)
     decs = np.random.uniform(2., 3., 100)
-    zs = np.random.uniform(2., 2.4, 100)
+    zs   = np.random.uniform(2., 2.4, 100)
 
-    pos = cartesian(ras, decs, zs)
+    pos  = cartesian(ras, decs, zs)
 
     print(pos)

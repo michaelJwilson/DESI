@@ -1,104 +1,194 @@
 import os
+import sys
 import argparse
 import runtime
 import numpy           as np
 import astropy.io.fits as fits
 
-from   astropy.table   import Table
-from   cosmo           import cosmo, distmod
-from   gama_limits     import gama_field
-from   cartesian       import cartesian, rotate
+from   config           import Configuration
+from   findfile         import findfile, overwrite_check, write_desitable
+from   astropy.table    import Table
+from   cosmo            import cosmo, distmod
+from   gama_limits      import gama_field
+from   cartesian        import cartesian, rotate
+from   bitmask          import BitMask, lumfn_mask
+from   config           import Configuration
+from   ddp_zlimits      import ddp_zlimits
 
 
-root   = os.environ['TILING_CATDIR']
-fpath  = root + '/TilingCatv46.fits'
-opath  = os.environ['GOLD_DIR'] + '/gama_gold.fits'
+def gama_gold(argset):
+    if argset.log:
+        logfile = findfile(ftype='gold', dryrun=False, survey='gama', log=True)
 
-parser = argparse.ArgumentParser(description='Gen kE cat.')
-parser.add_argument('--nooverwrite',  help='Do not overwrite outputs if on disk', action='store_true')
+        print(f'Logging to {logfile}')
 
-args   = parser.parse_args()
+        sys.stdout = open(logfile, 'w')
 
-if args.nooverwrite:
-    if os.path.isfile(opath):
-        print('{} found on disk and overwrite forbidden (--nooverwrite).'.format(opath))
-        exit(0)
+    root   = os.environ['TILING_CATDIR']
+    fpath  = root + '/TilingCatv46.fits'
 
-dat    = Table.read(fpath)
-dat    = Table(dat, masked=False)
+    opath  = findfile(ftype='gold', dryrun=False, survey='gama')
 
-# TODO: Inherit this from somewhere sensible.
-dat.meta['AREA'] = 180.
+    if argset.dryrun:
+        dpath = findfile(ftype='gold', dryrun=True, survey='gama')
 
-# print(dat.dtype.names)
+        if os.path.isfile(dpath):
+            print('Dryrun gama_gold created on full run; Exiting.')
+            return 0
 
-dat.rename_column('Z', 'ZGAMA')
+    if argset.nooverwrite:
+        overwrite_check(opath)
 
-for band in 'UGRIZ':
-    dat.rename_column('{}_MODEL'.format(band), '{}MAG_DRED_SDSS'.format(band))
+    dat     = Table.read(fpath)
+    dat     = Table(dat, masked=False)
+
+    keys    = list(dat.meta.keys())
+
+    for x in keys:
+        if x not in ['VERSION', 'DATE']:
+            del dat.meta[x]
+
+    dat.meta['AREA'] = 180.
     
-minimal_cols = ['CATAID', 'OBJID', 'RA', 'DEC', 'R_PETRO', 'ZGAMA', 'NQ', 'SPECID', 'SURVEY_CLASS']
+    # print(dat.dtype.names)
+    dat.rename_column('Z', 'ZGAMA')
 
-for band in ['U', 'G', 'R', 'I', 'Z']:
-    minimal_cols += ['{}MAG_DRED_SDSS'.format(band)]
+    for band in 'UGRIZ':
+        dat.rename_column('{}_MODEL'.format(band), '{}MAG_DRED_SDSS'.format(band))
+    
+    minimal_cols = ['CATAID', 'OBJID', 'RA', 'DEC', 'R_PETRO', 'ZGAMA', 'NQ', 'SPECID', 'SURVEY_CLASS']
 
-# Minimal catalogue.
-dat = dat[minimal_cols]
-dat.pprint()
+    for band in ['U', 'G', 'R', 'I', 'Z']:
+        minimal_cols += ['{}MAG_DRED_SDSS'.format(band)]
 
-# 'SURVEY_CLASS' < 4 for GAMA-II (rpet <= 19.8 by extension.
-# 0.039 < z < 0.263, DDP1 sample.	
-# r=12 bright cut;
-# 1 cat. per field (G9, 12, 15).
+    # Minimal catalogue.
+    dat = dat[minimal_cols]
 
-sclass_cut = (dat['SURVEY_CLASS'] >= 4)
-z_cut      = (dat['ZGAMA'] > 0.039) & (dat['ZGAMA'] < 0.263)
-r_cut      = (dat['R_PETRO'] > 12)
-nq_cut     = (dat['NQ'] >= 3)
+    # 'SURVEY_CLASS' < 4 for GAMA-II (rpet <= 19.8 by extension.
+    # r=12 bright cut;
+    # 1 cat. per field (G9, 12, 15).
+    
+    zlow       = ddp_zlimits['DDP1'][0]
+    zhigh      = ddp_zlimits['DDP1'][1]
 
-print(np.mean(sclass_cut))
-print(np.mean(z_cut))
-print(np.mean(r_cut))
-print(np.mean(nq_cut))
+    sclass_cut = (dat['SURVEY_CLASS'] >= 4)
+    z_cut      = (dat['ZGAMA'] > zlow) & (dat['ZGAMA'] < zhigh)
+    r_cut      = (dat['R_PETRO'] > 12)
+    nq_cut     = (dat['NQ'] >= 3)
 
-dat = dat[sclass_cut & z_cut & r_cut & nq_cut]
+    print(np.mean(sclass_cut))
+    print(np.mean(z_cut))
+    print(np.mean(r_cut))
+    print(np.mean(nq_cut))
 
-dat['LUMDIST'] = cosmo.luminosity_distance(dat['ZGAMA'].data)
-dat['DISTMOD'] = distmod(dat['ZGAMA'].data)
+    dat = dat[sclass_cut & z_cut & r_cut & nq_cut]
 
-dat['FIELD']   = gama_field(dat['RA'], dat['DEC'])
+    dat['ZSURV']     = dat['ZGAMA']
+    dat['LUMDIST'] = cosmo.luminosity_distance(dat['ZGAMA'].data)
+    dat['DISTMOD'] = distmod(dat['ZGAMA'].data)
+    dat['FIELD']   = gama_field(dat['RA'], dat['DEC'])
+    dat['IN_D8LUMFN'] = np.zeros_like(dat['FIELD'], dtype=int)
+    dat['CONSERVATIVE'] = np.zeros_like(dat['FIELD'], dtype=int)
+    
+    xyz = cartesian(dat['RA'], dat['DEC'], dat['ZGAMA'])
+    
+    dat['CARTESIAN_X'] = xyz[:,0]
+    dat['CARTESIAN_Y'] = xyz[:,1]
+    dat['CARTESIAN_Z'] = xyz[:,2]
+    
+    xyz = rotate(dat['RA'], dat['DEC'], xyz)
 
-xyz = cartesian(dat['RA'], dat['DEC'], dat['ZGAMA'])
+    dat['ROTCARTESIAN_X'] = xyz[:,0]
+    dat['ROTCARTESIAN_Y'] = xyz[:,1]
+    dat['ROTCARTESIAN_Z'] = xyz[:,2]
+    
+    dat['GMR']    = dat['GMAG_DRED_SDSS'] - dat['RMAG_DRED_SDSS']
+    dat['DETMAG'] = dat['R_PETRO']
+    
+    '''
+    Note: survey_specifics is deprecated
 
-dat['CARTESIAN_X'] = xyz[:,0]
-dat['CARTESIAN_Y'] = xyz[:,1]
-dat['CARTESIAN_Z'] = xyz[:,2]
+    if argset.in_bgsbright:
+        offset             = survey_specifics('desi')['pet_offset']
 
-xyz = rotate(dat['RA'], dat['DEC'], xyz)
+        update_bit(dat['IN_D8LUMFN'], lumfn_mask, 'INBGSBRIGHT', dat['DETMAG'].data + offset < 19.5)
+    '''
+    
+    # Randomise rows.
+    idx = np.arange(len(dat))
+    idx = np.random.choice(idx, size=len(idx), replace=False)
 
-dat['ROTCARTESIAN_X'] = xyz[:,0]
-dat['ROTCARTESIAN_Y'] = xyz[:,1]
-dat['ROTCARTESIAN_Z'] = xyz[:,2]
+    dat = dat[idx]
 
-# Randomise rows.
-idx = np.arange(len(dat))
-idx = np.random.choice(idx, size=len(idx), replace=False)
+    print('Solved for GAMA gold')
 
-dat = dat[idx]
+    if not os.path.isdir(os.environ['GOLD_DIR']):
+        print('Creating {}'.format(os.environ['GOLD_DIR']))
+        
+        os.makedirs(os.environ['GOLD_DIR'])
 
-print('Writing {}.'.format(os.environ['GOLD_DIR'] + '/gama_gold.fits'))
+    # 113687 vs TMR 80922.
+    dat.meta['GOLD_NGAL'] = len(dat)
+    dat.pprint()
+    
+    dat.meta = {'AREA': dat.meta['AREA'],\
+                'GOLD_NGAL': dat.meta['GOLD_NGAL'],\
+                'IMMUTABLE': 'FALSE',\
+                'RLIM': 19.8,\
+                'RMAX': 12.0,\
+                'MAX_SEP': 70.0} 
 
-if not os.path.isdir(os.environ['GOLD_DIR']):
-    print('Creating {}'.format(os.environ['GOLD_DIR']))
+    print('Writing {}.'.format(opath))
 
-    os.makedirs(os.environ['GOLD_DIR'])
+    write_desitable(opath, dat)
+    
+    # Dryrun:  2x2 sq. patch of sky.
+    # G12
+    delta_deg = 0.5
 
-# 113687 vs TMR 80922.
-dat.meta['GOLD_NGAL'] = len(dat)
-dat.pprint()
-dat.write(opath, format='fits', overwrite=True)
+    isin   = (dat['RA']  > 180. - delta_deg) & (dat['RA']  < 180. + delta_deg)
+    isin  &= (dat['DEC'] > 0.0 - delta_deg) & (dat['DEC'] < 0.0 + delta_deg)
+    
+    allin  = isin 
 
-idx   = np.random.choice(np.arange(len(dat)), 5000, replace=False)
-dat   = dat[idx]
+    # G9
+    isin   = (dat['RA']  > 135. - delta_deg) & (dat['RA']  < 135. + delta_deg)
+    isin  &= (dat['DEC'] > 0.0 - delta_deg) & (dat['DEC'] < 0.0 + delta_deg)
 
-dat.write(os.environ['CODE_ROOT'] + '/data/gama_gold_dryrun.fits', format='fits', overwrite=True)
+    allin |= isin
+
+    # G15
+    isin   = (dat['RA']  > 217. - delta_deg) & (dat['RA']  < 217. + delta_deg)
+    isin  &= (dat['DEC'] > 0.0 - delta_deg) & (dat['DEC'] < 0.0 + delta_deg)
+
+    allin |= isin
+
+    dat    = dat[allin]
+
+    opath  = findfile(ftype='gold', dryrun=True, survey='gama')
+
+    write_desitable(opath, dat)
+
+    print('Writing {}.'.format(opath))
+
+    if argset.log:
+        sys.stdout.close()
+
+    return 0
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Gen GAMA gold cat.')
+    parser.add_argument('--log', help='Create a log file of stdout.', action='store_true')
+    parser.add_argument('--config',       help='Path to configuration file', type=str, default=findfile('config'))
+    parser.add_argument('--dryrun',       help='Dryrun of 5k galaxies', action='store_true')
+    parser.add_argument('--nooverwrite',  help='Do not overwrite outputs if on disk', action='store_true')
+    parser.add_argument('--in_bgsbright', help='Add flag for IN_BGSBRIGHT', action='store_true')
+
+    args = parser.parse_args()
+
+    config = Configuration(args.config)
+    config.update_attributes('gold', args)
+    config.write()
+
+    gama_gold(args)
